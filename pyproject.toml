@@ -7,4 +7,9 @@ requires-python = ">=3.14"
 dependencies = [
     "anthropic>=1.13.0",
     "dotenv>=0.9.9",
+    "openai>=3.28.0",
+    "pandas>=3.0.6",
+    "pgvector>=0.5.1",
+    "psycopg[binary]>=3.3.6",
+    "pyarrow>=26.0.0",
 ]
