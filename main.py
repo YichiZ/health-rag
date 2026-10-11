@@ -75,7 +75,6 @@ def ingest():
             conn.commit()
 
 import asyncio
-import re
 import time
 from openai import AsyncOpenAI
 
@@ -166,18 +165,6 @@ def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int
                     embeddings[i],
                 )
 
-def retry_after_seconds(err: openai.RateLimitError) -> float:
-    response = getattr(err, "response", None)
-    headers = getattr(response, "headers", None) or {}
-    header = headers.get("retry-after")
-    if header:
-        return float(header)
-    match = re.search(r"try again in ([0-9.]+)(ms|s)", str(err))
-    if not match:
-        return 1.0
-    amount = float(match.group(1))
-    return amount / 1000 if match.group(2) == "ms" else amount
-
 async def embed_batch(client, semaphore: asyncio.Semaphore, batch, min_interval: float):
     texts = []
     for row in batch:
@@ -189,20 +176,16 @@ async def embed_batch(client, semaphore: asyncio.Semaphore, batch, min_interval:
 
     async with semaphore:
         started = time.perf_counter()
-        for attempt in range(10):
+        while True:
             try:
                 response = await client.embeddings.create(
                     model="text-embedding-3-small",
                     input=texts,
                 )
                 break
-            except openai.RateLimitError as err:
-                if attempt == 9:
-                    print(f"batch failed at position {int(batch[0].Index)}")
-                    raise
-                wait = retry_after_seconds(err)
-                print(f"rate limit at position {int(batch[0].Index)}, retrying in {wait:.3f}s")
-                await asyncio.sleep(wait)
+            except openai.RateLimitError:
+                print(f"rate limit at position {int(batch[0].Index)}, retrying in 60s")
+                await asyncio.sleep(60)
             except openai.APIError:
                 print(f"batch failed at position {int(batch[0].Index)}")
                 raise
