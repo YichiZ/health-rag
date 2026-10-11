@@ -11,11 +11,10 @@ from pgvector.psycopg import register_vector
 from pgvector import Vector
 from pathlib import Path
 
-DB_CONNECTION_STRING = "postgresql://postgres:postgres@localhost:5432/videorag"
 TEXT_CORPUS_PATH = "data/enelpol-rag-mini-bioasq/text-corpus/train-00000-of-00001.parquet"
 
 def connect():
-    conn = psycopg.connect(os.environ.get("DB_CONNECTION_STRING", DB_CONNECTION_STRING))
+    conn = psycopg.connect(os.environ["DB_CONNECTION_STRING"])
     register_vector(conn)
     return conn
 
@@ -165,7 +164,7 @@ def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int
                     embeddings[i],
                 )
 
-async def embed_batch(client, semaphore: asyncio.Semaphore, batch, min_interval: float):
+async def embed_batch(client, semaphore: asyncio.Semaphore, batch):
     texts = []
     for row in batch:
         passage = row.passage
@@ -175,7 +174,6 @@ async def embed_batch(client, semaphore: asyncio.Semaphore, batch, min_interval:
         texts.append(passage)
 
     async with semaphore:
-        started = time.perf_counter()
         while True:
             try:
                 response = await client.embeddings.create(
@@ -189,9 +187,6 @@ async def embed_batch(client, semaphore: asyncio.Semaphore, batch, min_interval:
             except openai.APIError:
                 print(f"batch failed at position {int(batch[0].Index)}")
                 raise
-        remaining = min_interval - (time.perf_counter() - started)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
     return batch, response
 
 async def ingest_batch_parallel(
@@ -210,11 +205,8 @@ async def ingest_batch_parallel(
     rows = list(df.itertuples())
     batches = [rows[offset : offset + batch_size] for offset in range(0, len(rows), batch_size)]
     semaphore = asyncio.Semaphore(window_size)
-    # 100-row batches at 3,300 rows/minute. Scale by window so concurrent
-    # batches still stay under the 1,000,000 token-per-minute cap.
-    min_interval = 1.82 * window_size
     tasks = [
-        asyncio.create_task(embed_batch(client, semaphore, batch, min_interval))
+        asyncio.create_task(embed_batch(client, semaphore, batch))
         for batch in batches
     ]
 
@@ -255,7 +247,7 @@ def query(text: str):
                 ORDER BY embedding <=> %s
                 LIMIT %s
                 """,
-                (embedding, embedding, 5)
+                (embedding, embedding, 10)
             )
             rows = cur.fetchall()
             
@@ -263,6 +255,28 @@ def query(text: str):
             with path.open("w") as f:
                 for position, passage_id, passage, distance in rows:
                     f.write(f"{position}\t{passage_id}\t{distance}\n{passage}\n\n")
+
+            # Generate result
+            client = anthropic.Client(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+            context = "\n\n".join(
+                f"[{passage_id}] {passage}" for _, passage_id, passage, _ in rows
+            )
+
+            system = "Answer the question in one or two sentences using only the passages. If they do not contain the answer, say so."
+            user_message = f"Question: {text}\n\nPassages:\n{context}"
+
+            result = client.messages.create(
+                model="claude-sonnet-5-5",
+                max_tokens = 1024,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+            )
+
+            answer = "\n".join(block.text for block in result.content if isinstance(block, TextBlock))
+
+            print(answer)
+                
 
 
 if __name__ == "__main__":

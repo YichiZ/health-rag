@@ -11,7 +11,10 @@ wheels/
 
 # Secrets and local editor config
 .env
+.env.*
+!.env.example
 .vscode/
+.DS_Store
 
 # Generated query output
 output/
