@@ -24,10 +24,12 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ingest", action="store_true")
+    parser.add_argument("--start-pos", type=int, default=0)
+    parser.add_argument("--end-pos", type=int)
     parser.add_argument("--query")
     args = parser.parse_args()
     if args.ingest:
-        asyncio.run(ingest_parallel())
+        asyncio.run(ingest_parallel(args.start_pos, args.end_pos))
     if args.query is not None:
         query(args.query)
 
@@ -63,21 +65,29 @@ import asyncio
 import time
 from openai import AsyncOpenAI
 
-async def embed_one(client,  passage_id: int, passage: str, parallel_limit: int = 4,):
+async def embed_one(client, position: int, passage_id: int, passage: str, parallel_limit: int = 4):
     async with asyncio.Semaphore(parallel_limit):
-        response = await client.embeddings.create(
-            model="text-embedding-3-small",
-            input=passage
-        )
+        try:
+            response = await client.embeddings.create(
+                model="text-embedding-3-small",
+                input=passage,
+            )
+        except openai.RateLimitError:
+            print(f"rate limit at position {position}, passage {passage_id}")
+            raise
     return passage_id, passage, response.data[0].embedding
 
-async def ingest_parallel():
+async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None):
     started = time.perf_counter()
-    df = pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet").reset_index()
+    df = (
+        pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet")
+        .reset_index()
+        .iloc[start_pos:end_pos]
+    )
     client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     
     tasks = [
-        embed_one(client, int(row.id), row.passage) for row in df.itertuples(index=False)
+        embed_one(client, row.Index, int(row.id), row.passage) for row in df.itertuples()
     ]
 
     path = Path("output/ingest-times.txt")
