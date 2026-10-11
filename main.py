@@ -75,6 +75,7 @@ def ingest():
             conn.commit()
 
 import asyncio
+import re
 import time
 from openai import AsyncOpenAI
 
@@ -165,17 +166,49 @@ def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int
                     embeddings[i],
                 )
 
-async def embed_batch(client, semaphore: asyncio.Semaphore, batch):
+def retry_after_seconds(err: openai.RateLimitError) -> float:
+    response = getattr(err, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    header = headers.get("retry-after")
+    if header:
+        return float(header)
+    match = re.search(r"try again in ([0-9.]+)(ms|s)", str(err))
+    if not match:
+        return 1.0
+    amount = float(match.group(1))
+    return amount / 1000 if match.group(2) == "ms" else amount
+
+async def embed_batch(client, semaphore: asyncio.Semaphore, batch, min_interval: float):
+    texts = []
+    for row in batch:
+        passage = row.passage
+        if len(passage) > 20_000:
+            print(f"truncating passage at position {int(row.Index)} from {len(passage)} chars")
+            passage = passage[:20_000]
+        texts.append(passage)
+
     async with semaphore:
-        try:
-            response = await client.embeddings.create(
-                model="text-embedding-3-small",
-                input=[row.passage for row in batch],
-            )
-        except openai.APIError:
-            batch_start = int(batch[0].Index)
-            print(f"batch failed at position {batch_start}")
-            raise
+        started = time.perf_counter()
+        for attempt in range(10):
+            try:
+                response = await client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=texts,
+                )
+                break
+            except openai.RateLimitError as err:
+                if attempt == 9:
+                    print(f"batch failed at position {int(batch[0].Index)}")
+                    raise
+                wait = retry_after_seconds(err)
+                print(f"rate limit at position {int(batch[0].Index)}, retrying in {wait:.3f}s")
+                await asyncio.sleep(wait)
+            except openai.APIError:
+                print(f"batch failed at position {int(batch[0].Index)}")
+                raise
+        remaining = min_interval - (time.perf_counter() - started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
     return batch, response
 
 async def ingest_batch_parallel(
@@ -190,18 +223,22 @@ async def ingest_batch_parallel(
         .reset_index()
         .iloc[start_pos:end_pos]
     )
-    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), max_retries=0)
     rows = list(df.itertuples())
     batches = [rows[offset : offset + batch_size] for offset in range(0, len(rows), batch_size)]
     semaphore = asyncio.Semaphore(window_size)
+    # 100-row batches at 3,300 rows/minute. Scale by window so concurrent
+    # batches still stay under the 1,000,000 token-per-minute cap.
+    min_interval = 1.82 * window_size
     tasks = [
-        asyncio.create_task(embed_batch(client, semaphore, batch))
+        asyncio.create_task(embed_batch(client, semaphore, batch, min_interval))
         for batch in batches
     ]
 
     path = Path("output/ingest-times.txt")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with connect() as conn, path.open("w") as log:
+    log_mode = "a" if start_pos else "w"
+    with connect() as conn, path.open(log_mode) as log:
         for task in tasks:
             batch, response = await task
             embeddings = {item.index: item.embedding for item in response.data}
