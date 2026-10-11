@@ -24,12 +24,16 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ingest", action="store_true")
+    parser.add_argument("--ingest-batch", action="store_true")
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--end-pos", type=int)
+    parser.add_argument("--batch-size", type=int, default=250)
     parser.add_argument("--query")
     args = parser.parse_args()
     if args.ingest:
         asyncio.run(ingest_parallel(args.start_pos, args.end_pos))
+    if args.ingest_batch:
+        ingest_batch(args.start_pos, args.end_pos, args.batch_size)
     if args.query is not None:
         query(args.query)
 
@@ -67,8 +71,8 @@ import asyncio
 import time
 from openai import AsyncOpenAI
 
-async def embed_one(client, position: int, passage_id: int, passage: str, parallel_limit: int = 4):
-    async with asyncio.Semaphore(parallel_limit):
+async def embed_one(client, semaphore: asyncio.Semaphore, position: int, passage_id: int, passage: str):
+    async with semaphore:
         try:
             response = await client.embeddings.create(
                 model="text-embedding-3-small",
@@ -79,7 +83,25 @@ async def embed_one(client, position: int, passage_id: int, passage: str, parall
             raise
     return position, passage_id, passage, response.data[0].embedding
 
-async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None):
+def save_passage(conn, log, started: float, position: int, passage_id: int, passage: str, embedding):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO passages (id, position, passage, embedding)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE
+            SET position = EXCLUDED.position,
+                passage = EXCLUDED.passage,
+                embedding = EXCLUDED.embedding
+            """,
+            (passage_id, position, passage, embedding),
+        )
+    elapsed = time.perf_counter() - started
+    log.write(f"{position}\t{passage_id}\t{elapsed:.6f}\n")
+    log.flush()
+    conn.commit()
+
+async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None, window: int = 4):
     started = time.perf_counter()
     df = (
         pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet")
@@ -87,38 +109,54 @@ async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None):
         .iloc[start_pos:end_pos]
     )
     client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    
-    tasks = [
-        embed_one(client, row.Index, int(row.id), row.passage) for row in df.itertuples()
-    ]
+    semaphore = asyncio.Semaphore(window)
+
+    tasks = [asyncio.create_task(embed_one(client, semaphore, row.Index, int(row.id), row.passage)) 
+    for row in df.itertuples()]
 
     path = Path("output/ingest-times.txt")
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn, path.open("w") as log:
         for finished in asyncio.as_completed(tasks):
             position, passage_id, passage, embedding = await finished
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO passages (id, position, passage, embedding)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE
-                    SET position = EXCLUDED.position,
-                        passage = EXCLUDED.passage,
-                        embedding = EXCLUDED.embedding
-                    """,
-                    (passage_id, position, passage, embedding),
+            save_passage(conn, log, started, position, passage_id, passage, embedding)
+
+def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int = 250):
+    started = time.perf_counter()
+    df = (
+        pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet")
+        .reset_index()
+        .iloc[start_pos:end_pos]
+    )
+    client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    rows = list(df.itertuples())
+
+    path = Path("output/ingest-times.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with connect() as conn, path.open("w") as log:
+        for offset in range(0, len(rows), batch_size):
+            batch = rows[offset : offset + batch_size]
+            batch_start = int(batch[0].Index)
+            try:
+                response = client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=[row.passage for row in batch],
                 )
-            # Perf
-            elapsed = time.perf_counter() - started
-            log.write(f"{passage_id}\t{elapsed:.6f}\n")
-            log.flush()
+            except openai.APIError:
+                print(f"batch failed at position {batch_start}")
+                raise
 
-            # Commit
-            conn.commit()
-
-def ingest_batch():
-    pass
+            embeddings = {item.index: item.embedding for item in response.data}
+            for i, row in enumerate(batch):
+                save_passage(
+                    conn,
+                    log,
+                    started,
+                    int(row.Index),
+                    int(row.id),
+                    row.passage,
+                    embeddings[i],
+                )
 
 def query(text: str):
     print(text)
