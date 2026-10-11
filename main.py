@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--query")
     args = parser.parse_args()
     if args.ingest:
-        ingest()
+        asyncio.run(ingest_parallel())
     if args.query is not None:
         query(args.query)
 
@@ -36,7 +36,6 @@ def ingest():
     df = pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet").reset_index()
 
     with connect() as conn:
-        i = 0
         for row in df.itertuples(index=False):
             passage_id = int(row.id)
             passage = row.passage
@@ -58,6 +57,51 @@ def ingest():
                     """,
                     (passage_id, passage, embedding),
                 )
+            conn.commit()
+
+import asyncio
+import time
+from openai import AsyncOpenAI
+
+async def embed_one(client,  passage_id: int, passage: str, parallel_limit: int = 4,):
+    async with asyncio.Semaphore(parallel_limit):
+        response = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=passage
+        )
+    return passage_id, passage, response.data[0].embedding
+
+async def ingest_parallel():
+    started = time.perf_counter()
+    df = pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet").reset_index()
+    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    
+    tasks = [
+        embed_one(client, int(row.id), row.passage) for row in df.itertuples(index=False)
+    ]
+
+    path = Path("output/ingest-times.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with connect() as conn, path.open("w") as log:
+        for finished in asyncio.as_completed(tasks):
+            passage_id, passage, embedding = await finished
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO passages (id, passage, embedding)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                    SET passage = EXCLUDED.passage,
+                        embedding = EXCLUDED.embedding
+                    """,
+                    (passage_id, passage, embedding),
+                )
+            # Perf
+            elapsed = time.perf_counter() - started
+            log.write(f"{passage_id}\t{elapsed:.6f}\n")
+            log.flush()
+
+            # Commit
             conn.commit()
 
 def ingest_batch():
