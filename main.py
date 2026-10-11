@@ -12,6 +12,7 @@ from pgvector import Vector
 from pathlib import Path
 
 DB_CONNECTION_STRING = "postgresql://postgres:postgres@localhost:5432/videorag"
+TEXT_CORPUS_PATH = "data/enelpol-rag-mini-bioasq/text-corpus/train-00000-of-00001.parquet"
 
 def connect():
     conn = psycopg.connect(os.environ.get("DB_CONNECTION_STRING", DB_CONNECTION_STRING))
@@ -25,21 +26,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ingest", action="store_true")
     parser.add_argument("--ingest-batch", action="store_true")
+    parser.add_argument("--ingest-batch-parallel", action="store_true")
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--end-pos", type=int)
-    parser.add_argument("--batch-size", type=int, default=250)
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--window-size", type=int, default=4)
     parser.add_argument("--query")
     args = parser.parse_args()
     if args.ingest:
         asyncio.run(ingest_parallel(args.start_pos, args.end_pos))
     if args.ingest_batch:
         ingest_batch(args.start_pos, args.end_pos, args.batch_size)
+    if args.ingest_batch_parallel:
+        asyncio.run(ingest_batch_parallel(
+            args.start_pos, args.end_pos, args.batch_size, args.window_size
+        ))
     if args.query is not None:
         query(args.query)
 
 def ingest():
     # id is the parquet index, not a column.
-    df = pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet").reset_index()
+    df = pd.read_parquet(TEXT_CORPUS_PATH).reset_index()
 
     with connect() as conn:
         for row in df.itertuples():
@@ -101,15 +108,15 @@ def save_passage(conn, log, started: float, position: int, passage_id: int, pass
     log.flush()
     conn.commit()
 
-async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None, window: int = 4):
+async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None, window_size: int = 4):
     started = time.perf_counter()
     df = (
-        pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet")
+        pd.read_parquet(TEXT_CORPUS_PATH)
         .reset_index()
         .iloc[start_pos:end_pos]
     )
     client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    semaphore = asyncio.Semaphore(window)
+    semaphore = asyncio.Semaphore(window_size)
 
     tasks = [asyncio.create_task(embed_one(client, semaphore, row.Index, int(row.id), row.passage)) 
     for row in df.itertuples()]
@@ -121,10 +128,10 @@ async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None, window
             position, passage_id, passage, embedding = await finished
             save_passage(conn, log, started, position, passage_id, passage, embedding)
 
-def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int = 250):
+def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int = 100):
     started = time.perf_counter()
     df = (
-        pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet")
+        pd.read_parquet(TEXT_CORPUS_PATH)
         .reset_index()
         .iloc[start_pos:end_pos]
     )
@@ -146,6 +153,57 @@ def ingest_batch(start_pos: int = 0, end_pos: int | None = None, batch_size: int
                 print(f"batch failed at position {batch_start}")
                 raise
 
+            embeddings = {item.index: item.embedding for item in response.data}
+            for i, row in enumerate(batch):
+                save_passage(
+                    conn,
+                    log,
+                    started,
+                    int(row.Index),
+                    int(row.id),
+                    row.passage,
+                    embeddings[i],
+                )
+
+async def embed_batch(client, semaphore: asyncio.Semaphore, batch):
+    async with semaphore:
+        try:
+            response = await client.embeddings.create(
+                model="text-embedding-3-small",
+                input=[row.passage for row in batch],
+            )
+        except openai.APIError:
+            batch_start = int(batch[0].Index)
+            print(f"batch failed at position {batch_start}")
+            raise
+    return batch, response
+
+async def ingest_batch_parallel(
+    start_pos: int = 0,
+    end_pos: int | None = None,
+    batch_size: int = 100,
+    window_size: int = 4,
+):
+    started = time.perf_counter()
+    df = (
+        pd.read_parquet(TEXT_CORPUS_PATH)
+        .reset_index()
+        .iloc[start_pos:end_pos]
+    )
+    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    rows = list(df.itertuples())
+    batches = [rows[offset : offset + batch_size] for offset in range(0, len(rows), batch_size)]
+    semaphore = asyncio.Semaphore(window_size)
+    tasks = [
+        asyncio.create_task(embed_batch(client, semaphore, batch))
+        for batch in batches
+    ]
+
+    path = Path("output/ingest-times.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with connect() as conn, path.open("w") as log:
+        for task in tasks:
+            batch, response = await task
             embeddings = {item.index: item.embedding for item in response.data}
             for i, row in enumerate(batch):
                 save_passage(
