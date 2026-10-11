@@ -38,7 +38,8 @@ def ingest():
     df = pd.read_parquet("data/rag-mini-bioasq/text-corpus.parquet").reset_index()
 
     with connect() as conn:
-        for row in df.itertuples(index=False):
+        for row in df.itertuples():
+            position = int(row.Index)
             passage_id = int(row.id)
             passage = row.passage
             client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -51,13 +52,14 @@ def ingest():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO passages (id, passage, embedding)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO passages (id, position, passage, embedding)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
-                    SET passage = EXCLUDED.passage,
+                    SET position = EXCLUDED.position,
+                        passage = EXCLUDED.passage,
                         embedding = EXCLUDED.embedding
                     """,
-                    (passage_id, passage, embedding),
+                    (passage_id, position, passage, embedding),
                 )
             conn.commit()
 
@@ -75,7 +77,7 @@ async def embed_one(client, position: int, passage_id: int, passage: str, parall
         except openai.RateLimitError:
             print(f"rate limit at position {position}, passage {passage_id}")
             raise
-    return passage_id, passage, response.data[0].embedding
+    return position, passage_id, passage, response.data[0].embedding
 
 async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None):
     started = time.perf_counter()
@@ -94,17 +96,18 @@ async def ingest_parallel(start_pos: int = 0, end_pos: int | None = None):
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn, path.open("w") as log:
         for finished in asyncio.as_completed(tasks):
-            passage_id, passage, embedding = await finished
+            position, passage_id, passage, embedding = await finished
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO passages (id, passage, embedding)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO passages (id, position, passage, embedding)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
-                    SET passage = EXCLUDED.passage,
+                    SET position = EXCLUDED.position,
+                        passage = EXCLUDED.passage,
                         embedding = EXCLUDED.embedding
                     """,
-                    (passage_id, passage, embedding),
+                    (passage_id, position, passage, embedding),
                 )
             # Perf
             elapsed = time.perf_counter() - started
@@ -131,7 +134,7 @@ def query(text: str):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, passage, embedding <=> %s AS distance
+                SELECT position, id, passage, embedding <=> %s AS distance
                 FROM passages
                 ORDER BY embedding <=> %s
                 LIMIT %s
@@ -142,8 +145,8 @@ def query(text: str):
             
             path = Path("output/query-results.txt")
             with path.open("w") as f:
-                for passage_id, passage, distance in rows:
-                    f.write(f"{passage_id}\t{distance}\n{passage}\n\n")
+                for position, passage_id, passage, distance in rows:
+                    f.write(f"{position}\t{passage_id}\t{distance}\n{passage}\n\n")
 
 
 if __name__ == "__main__":
