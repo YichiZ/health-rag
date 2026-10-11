@@ -1,10 +1,10 @@
 # health-rag
 
-A simple RAG over a passage corpus.
+A simple RAG over a passage corpus. Ingest is an exercise in parallelizing and batching calls to the embedding API.
 
 Ingest embeds each passage with OpenAI and stores it in Postgres. A query embeds the question, retrieves the nearest passages, and asks Claude to answer from those passages only.
 
-The passages are the [enelpol/rag-mini-bioasq](https://huggingface.co/datasets/enelpol/rag-mini-bioasq) corpus, a cleaned subset of [BioASQ](https://www.bioasq.org/) training data (via [rag-datasets/rag-mini-bioasq](https://huggingface.co/datasets/rag-datasets/rag-mini-bioasq)).
+We train the model on the [RAG mini BioASQ](https://huggingface.co/datasets/enelpol/rag-mini-bioasq) training data, a cleaned subset of [BioASQ](https://www.bioasq.org/) (via [rag-datasets/rag-mini-bioasq](https://huggingface.co/datasets/rag-datasets/rag-mini-bioasq)). Ingest reads the train passage corpus at `data/enelpol-rag-mini-bioasq/text-corpus/train-00000-of-00001.parquet`.
 
 ## How a query runs
 
@@ -61,7 +61,11 @@ The app reads `DB_CONNECTION_STRING` from `.env`.
 
 ## Index the corpus
 
-Embed the train corpus and store it. This reads `data/enelpol-rag-mini-bioasq/text-corpus/train-00000-of-00001.parquet` (40,221 passages) and sends them to OpenAI in batches of 100, four batches at a time. If a batch hits a rate limit, that batch waits 60 seconds and retries until it succeeds.
+Embed the train corpus and store it. This reads `data/enelpol-rag-mini-bioasq/text-corpus/train-00000-of-00001.parquet` (40,221 passages). Three commands exercise the embedding calls:
+
+- `--ingest` sends one passage per request, up to four at a time.
+- `--ingest-batch` sends batches of 100, one batch after another.
+- `--ingest-batch-parallel` sends batches of 100, four batches at a time. If a batch hits a rate limit, that batch waits 60 seconds and retries until it succeeds.
 
 ```bash
 uv run python main.py --ingest-batch-parallel
@@ -76,15 +80,13 @@ uv run python main.py --ingest-batch-parallel --start-pos 0 --end-pos 1000
 
 `--batch-size` defaults to 100 and `--window-size` defaults to 4. Passages longer than 20,000 characters are truncated before embedding. Each finished row is logged to `output/ingest-times.txt` as `position`, passage `id`, and elapsed seconds. A run that starts at row 0 overwrites that file. A run with `--start-pos` greater than 0 appends to it.
 
-Two other ingest commands are available. `--ingest` embeds one passage per request, up to four at a time. `--ingest-batch` embeds batches one after another.
-
 ## Ask a question
 
 ```bash
 uv run python main.py --query "What is the implication of histone lysine methylation in medulloblastoma?"
 ```
 
-The answer is printed in the terminal. The retrieved passages are written to `output/query-results.txt`, one block per hit:
+The answer is printed in the terminal and written to `output/answer.txt`. The retrieved passages are written to `output/query-results.txt`, one block per hit:
 
 ```text
 position	passage_id	cosine_distance
